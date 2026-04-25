@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 
-from audio.tts import speak
+from audio.tts import speak, start_tts
 from decision.decision_engine import compute_confidence
 from llm.cloud_api import call_cloud_api
 from llm.ollama_local import query_ollama
@@ -112,6 +112,7 @@ class RealTimeAISystem:
 
     def start(self) -> None:
         self.logger.info("Starting wearable assistant pipeline.")
+        start_tts()
         speak(
             "Assistant is ready. You can say start scene description mode, start navigation mode, switch to obstacle awareness, or pause.",
             priority="medium",
@@ -368,10 +369,11 @@ class RealTimeAISystem:
         if any(len(w) > 16 for w in sentence.split()):
             return self._fallback_instruction(mode, scene_text)
 
-        # Force actionable navigation-safe intent.
-        allowed_verbs = {"move", "step", "turn", "keep", "stop", "pause", "scan", "continue", "shift"}
-        if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
-            return self._fallback_instruction(mode, scene_text)
+        # Force actionable navigation-safe intent (unless describing the scene).
+        if mode != AssistantMode.SCENE_DESCRIPTION:
+            allowed_verbs = {"move", "step", "turn", "keep", "stop", "pause", "scan", "continue", "shift"}
+            if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
+                return self._fallback_instruction(mode, scene_text)
 
         cleaned = sentence[0].upper() + sentence[1:] if sentence else sentence
         return f"{cleaned}."
@@ -473,7 +475,7 @@ class RealTimeAISystem:
             return None
 
         self._last_cloud_attempt_ts = time.time()
-        cloud_text = call_cloud_api(scene_text, reason)
+        cloud_text = call_cloud_api(scene_text, reason, mode.value)
 
         if self._is_cloud_failure_text(cloud_text):
             self._cloud_failures += 1
@@ -639,7 +641,8 @@ class RealTimeAISystem:
                 continue
 
             now = time.time()
-            if (now - self._last_inference_step_ts) < self.config.inference_min_interval_sec:
+            min_interval = 2.0 if mode == AssistantMode.SCENE_DESCRIPTION else self.config.inference_min_interval_sec
+            if (now - self._last_inference_step_ts) < min_interval:
                 self.frame_queue.task_done()
                 continue
             self._last_inference_step_ts = now
@@ -726,7 +729,7 @@ class RealTimeAISystem:
                         now = time.time()
                         if not response_text and (now - self._last_mode_status_ts) >= self.config.mode_status_interval_sec:
                             response_text = "Obstacle awareness is active. I am monitoring the area around you."
-                            source = "local_llm"
+                            source = "rule"
                             priority = "low"
                             self._last_mode_status_ts = now
                 elif mode == AssistantMode.SCENE_DESCRIPTION:
@@ -766,7 +769,7 @@ class RealTimeAISystem:
                         source = "local_llm"
                         priority = "low"
 
-                if response_text:
+                if response_text and source != "rule":
                     response_text = self._sanitize_instruction(response_text, mode, scene_text)
 
                 # Keep user informed even in stable scenes, but with long cooldown.

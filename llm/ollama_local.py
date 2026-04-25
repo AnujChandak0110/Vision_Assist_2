@@ -56,12 +56,25 @@ LOGGER = _get_logger()
 
 def build_prompt(scene_data: Dict[str, Any]) -> str:
     """
-    Build a focused prompt for blind navigation guidance.
+    Build a focused prompt for blind navigation guidance or scene description.
 
     Expected scene_data is any JSON-serializable dictionary containing
     object detections, positions, distances, and environment cues.
     """
     compact_scene = json.dumps(scene_data, ensure_ascii=True, separators=(",", ":"))
+    mode = scene_data.get("mode", "navigation")
+
+    if mode == "scene_description":
+        return (
+            "You are an assistant for a blind user. "
+            "Return exactly one short sentence describing the scene in front of the user. "
+            "Prioritize naming objects, their positions, and distances. "
+            "Use plain language, maximum 14 words. "
+            "No explanation, no reasoning. "
+            "Never suggest approaching or following people. "
+            "If uncertain, say: Pause and scan around. "
+            f"Scene data: {compact_scene}"
+        )
 
     return (
         "You are a blind navigation assistant. "

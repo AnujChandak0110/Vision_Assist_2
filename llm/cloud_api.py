@@ -116,9 +116,9 @@ def _trim_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     return snippet
 
 
-def build_prompt(scene: str, reason: str) -> str:
+def build_prompt(scene: str, reason: str, mode: str = "navigation") -> str:
     """
-    Build a short, safety-focused navigation prompt.
+    Build a short, safety-focused prompt based on the mode.
 
     reason should be:
     - low_confidence
@@ -127,6 +127,16 @@ def build_prompt(scene: str, reason: str) -> str:
     reason_normalized = reason.strip().lower()
     if reason_normalized not in ALLOWED_REASONS:
         reason_normalized = "low_confidence"
+
+    if mode == "scene_description":
+        return (
+            "You are an assistant for a blind user. "
+            "Return exactly one short sentence describing the scene in front of the user. "
+            "Prioritize naming objects, their positions, and distances. "
+            "No explanation, no reasoning, max 14 words. "
+            "Never suggest approaching or following people. "
+            f"Scene: {scene.strip()}"
+        )
 
     return (
         "You are a navigation assistant for a blind user. "
@@ -268,7 +278,7 @@ def _call_gemini(prompt: str) -> str:
     return str(text).strip()
 
 
-def call_cloud_api(scene: str, reason: str) -> str:
+def call_cloud_api(scene: str, reason: str, mode: str = "navigation") -> str:
     """
     Call selected cloud model and return short navigation text.
 
@@ -277,7 +287,7 @@ def call_cloud_api(scene: str, reason: str) -> str:
     - OPENAI_API_KEY (+ optional OPENAI_MODEL)
     - GEMINI_API_KEY (+ optional GEMINI_MODEL)
     """
-    prompt = build_prompt(scene, reason)
+    prompt = build_prompt(scene, reason, mode)
     provider = os.getenv("CLOUD_PROVIDER", "gemini").strip().lower()
 
     try:
