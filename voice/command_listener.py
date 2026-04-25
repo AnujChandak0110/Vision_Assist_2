@@ -140,20 +140,22 @@ class VoiceCommandListener:
                 self.logger.warning("Ambient noise calibration failed: %s", exc)
 
             while not self._stop_event.is_set():
-                # Skip listening while TTS is speaking to avoid mic feedback
+                # During TTS playback, use a shorter phrase limit so we quickly
+                # check for interrupt commands without long blocking waits.
+                # The mic stays ACTIVE so the user can always interrupt.
                 try:
                     from audio.tts import is_speaking
-                    if is_speaking():
-                        time.sleep(0.1)
-                        continue
+                    tts_active = is_speaking()
                 except ImportError:
-                    pass
+                    tts_active = False
+
+                phrase_limit = 2.0 if tts_active else self.config.phrase_time_limit
 
                 try:
                     audio = self._recognizer.listen(
                         source,
                         timeout=self.config.listen_timeout,
-                        phrase_time_limit=self.config.phrase_time_limit,
+                        phrase_time_limit=phrase_limit,
                     )
                 except Exception:
                     continue

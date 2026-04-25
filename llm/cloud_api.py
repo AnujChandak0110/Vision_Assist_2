@@ -28,7 +28,7 @@ GEMINI_ENDPOINT_TEMPLATE: Final[str] = (
 )
 
 DEFAULT_OPENAI_MODEL: Final[str] = "gpt-4o"
-DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3-flash-preview"
+DEFAULT_GEMINI_MODEL: Final[str] = "gemini-2.0-flash"
 DEFAULT_TIMEOUT_SECONDS: Final[int] = 8
 DEFAULT_MAX_CHARS: Final[int] = 160
 SCENE_DESC_MAX_CHARS: Final[int] = 500
@@ -133,26 +133,38 @@ def build_prompt(scene: str, reason: str, mode: str = "navigation") -> str:
 
     if mode == "scene_description":
         return (
-            "You are an assistant for a visually impaired user who cannot see anything. "
-            "Describe the scene in front of them in vivid, helpful detail. "
-            "Include: what objects are present, their approximate positions (left, center, right), "
-            "how far away they are (near, medium, far), colors if relevant, "
-            "the type of environment (indoor room, outdoor sidewalk, corridor, etc.), "
-            "lighting conditions, and any potential hazards or obstacles. "
-            "Use natural, conversational language as if you are their eyes. "
-            "Keep it to 3-4 sentences maximum. "
+            "You are the eyes of a blind person walking outdoors or indoors. "
+            "Describe exactly what is in front of them right now in 2-3 short, spoken sentences. "
+            "For each object: name it, say if it is on their left, center, or right, and say if it is near (within 2 steps), medium (3-5 steps), or far (beyond 5 steps). "
+            "Mention floor surfaces, steps, curbs, or doors if present. "
+            "Use simple words a person can act on immediately, like 'Chair on your left, arm's reach away.' "
+            "If the path is clear, say so clearly. "
+            "Never say 'I can see' or use any visual language about yourself. "
             "Never suggest approaching or following people. "
-            f"Scene data: {scene.strip()}"
+            f"What the camera sees: {scene.strip()}"
         )
 
+    if mode == "obstacle_awareness":
+        return (
+            "You are guiding a blind person who is walking right now. "
+            "Look at the scene and give ONE short spoken sentence about the most important thing they need to know for safety. "
+            "Name the object, say left/center/right, and say near/medium/far. "
+            "If something is near center, say stop. If path is clear, say so. "
+            "Max 12 words. No explanation. Examples: 'Person directly ahead, stop now.' or 'Path clear, continue forward.' "
+            "Never suggest approaching or following people. "
+            f"What the camera sees: {scene.strip()}"
+        )
+
+    # navigation and default
     return (
-        "You are a navigation assistant for a blind user. "
-        "Return exactly one short, actionable movement instruction for the next few seconds. "
-        "Prioritize safety and obstacle avoidance. "
-        "No explanation, no reasoning, no meta text, max 14 words. "
+        "You are guiding a blind person who is walking. "
+        "Give ONE short, spoken movement instruction for the next 2 seconds based on what is ahead. "
+        "Name any obstacles with their position (left/center/right) and distance (near/medium/far). "
+        "Use action words: step left, stop, continue, shift right, slow down. "
+        "Max 12 words. No reasoning, no options, no explanation. "
+        "Example: 'Person on your right, shift slightly left.' "
         "Never suggest approaching or following people. "
-        f"Trigger reason: {reason_normalized}. "
-        f"Scene: {scene.strip()}"
+        f"What the camera sees: {scene.strip()}"
     )
 
 
@@ -254,8 +266,8 @@ def _call_gemini(prompt: str, mode: str = "navigation") -> str:
     model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
     endpoint = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
 
-    # Scene description gets more tokens for rich, detailed output
-    max_tokens = 200 if mode == "scene_description" else 60
+    # Scene description needs more tokens for 2-3 spoken sentences
+    max_tokens = 300 if mode == "scene_description" else 80
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -278,14 +290,30 @@ def _call_gemini(prompt: str, mode: str = "navigation") -> str:
 
     candidates = body.get("candidates", [])
     if not candidates:
-        return "Stop briefly, scan around, then move slowly forward."
+        LOGGER.warning("Gemini returned no candidates. Body: %s", str(body)[:200])
+        return ""
 
     parts = candidates[0].get("content", {}).get("parts", [])
     if not parts:
-        return "Stop briefly, scan around, then move slowly forward."
+        LOGGER.warning("Gemini candidate has no parts. Candidate: %s", str(candidates[0])[:200])
+        return ""
 
-    text = parts[0].get("text", "")
-    return str(text).strip()
+    # Some models (thinking variants) return parts with 'thoughtSignature'.
+    # Extract only parts that contain plain text output, not reasoning traces.
+    text_parts = [
+        p.get("text", "") for p in parts
+        if "text" in p and "thoughtSignature" not in p
+    ]
+    # Fallback: if all parts have thoughtSignature, just take the text anyway
+    if not text_parts:
+        text_parts = [p.get("text", "") for p in parts if "text" in p]
+
+    text = " ".join(t.strip() for t in text_parts if t.strip())
+    if not text:
+        LOGGER.warning("Gemini response has empty text. Parts: %s", str(parts)[:200])
+        return ""
+
+    return text.strip()
 
 
 def call_cloud_api(scene: str, reason: str, mode: str = "navigation") -> str:

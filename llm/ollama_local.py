@@ -66,24 +66,33 @@ def build_prompt(scene_data: Dict[str, Any]) -> str:
 
     if mode == "scene_description":
         return (
-            "You are an assistant for a blind user. "
-            "Return exactly one short sentence describing the scene in front of the user. "
-            "Prioritize naming objects, their positions, and distances. "
-            "Use plain language, maximum 14 words. "
-            "No explanation, no reasoning. "
-            "Never suggest approaching or following people. "
-            "If uncertain, say: Pause and scan around. "
-            f"Scene data: {compact_scene}"
+            "You are the eyes of a blind person. "
+            "Name the objects you see, their position (left/center/right), and how far they are (near/medium/far). "
+            "One sentence per key object. Max 2 sentences total. "
+            "Example: 'Chair on your left, arm's reach. Clear path ahead.' "
+            "No reasoning. No extra words. "
+            f"Camera data: {compact_scene}"
         )
 
+    if mode == "obstacle_awareness":
+        return (
+            "You are guiding a blind person who is moving. "
+            "Look at the camera data. Give ONE action sentence. "
+            "Name the most important object, its side (left/center/right), and say near or medium. "
+            "If clear, say: Path clear, continue forward. "
+            "Max 10 words. No explanation. "
+            f"Camera data: {compact_scene}"
+        )
+
+    # navigation default
     return (
-        "You are a blind navigation assistant. "
-        "Return exactly one short sentence for immediate safe movement. "
-        "Use plain language, maximum 14 words. "
-        "No explanation, no reasoning, no meta text, no multiple options. "
-        "Never suggest approaching or following people. "
-        "If uncertain, say: Pause and scan around before moving. "
-        f"Scene data: {compact_scene}"
+        "You are guiding a blind person who is walking. "
+        "Give ONE spoken instruction for the next step. "
+        "Name obstacles with side (left/center/right) and distance (near/medium/far). "
+        "Use: stop, step left, shift right, continue, slow down. "
+        "Max 10 words. No reasoning. "
+        "Example: 'Bottle on your right, step left.' "
+        f"Camera data: {compact_scene}"
     )
 
 

@@ -11,6 +11,9 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import os
+import platform
+
 import cv2
 
 from audio.tts import speak, start_tts
@@ -27,9 +30,27 @@ from voice.command_listener import VoiceCommandListener
 Detection = Dict[str, Any]
 
 
+def _load_env_defaults() -> None:
+    """Load CAMERA_INDEX and other env vars from .env into RuntimeConfig defaults."""
+    from pathlib import Path
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, value)
+
+_load_env_defaults()
+
+
 @dataclass
 class RuntimeConfig:
-    camera_index: int = 0
+    camera_index: int = int(os.environ.get("CAMERA_INDEX", "0"))
     frame_stride: int = 3
     queue_size: int = 2
     detector_debug: bool = False
@@ -38,9 +59,9 @@ class RuntimeConfig:
     long_term_cloud_interval_sec: float = 12.0
     mode_status_interval_sec: float = 8.0
     inference_min_interval_sec: float = 0.35
-    cloud_min_interval_sec: float = 4.0
-    cloud_failure_cooldown_sec: float = 20.0
-    cloud_breaker_failure_threshold: int = 3
+    cloud_min_interval_sec: float = 8.0
+    cloud_failure_cooldown_sec: float = 30.0
+    cloud_breaker_failure_threshold: int = 2
     scene_stale_refresh_sec: float = 6.0
     speech_keepalive_interval_sec: float = 12.0
     cloud_low_confidence_threshold: float = 0.45
@@ -116,16 +137,14 @@ class RealTimeAISystem:
         self.logger.info("Starting wearable assistant pipeline.")
         start_tts()
         speak(
-            "Assistant is ready. You can say start scene description mode, start navigation mode, switch to obstacle awareness, or pause.",
+            "Assistant is ready. I can see for you. Say scene description, navigation, or obstacle awareness to begin.",
             priority="medium",
             category="system",
         )
 
-        if self.voice_listener.is_available():
-            speak("Voice commands are active. You can speak now.", priority="low", category="system")
-        else:
+        if not self.voice_listener.is_available():
             speak(
-                "Voice commands are unavailable right now. I can still guide you using camera analysis.",
+                "Microphone not found. Camera guidance is still active.",
                 priority="medium",
                 category="system",
             )
@@ -208,19 +227,43 @@ class RealTimeAISystem:
             speak(f"Mode selected: {readable}.", priority="medium", category="system")
 
     def _camera_loop(self) -> None:
-        cap = cv2.VideoCapture(self.config.camera_index)
+        # Use DirectShow on Windows for faster USB webcam init and stable reads
+        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(self.config.camera_index, backend)
+        if not cap.isOpened():
+            # Fallback: try without backend hint
+            cap = cv2.VideoCapture(self.config.camera_index)
         if not cap.isOpened():
             self.logger.error("Unable to open camera index %s", self.config.camera_index)
             speak("Camera unavailable. Please check camera connection.", priority="high", interrupt=True, category="safety")
             self.stop_event.set()
             return
 
-        self.logger.info("Camera thread started.")
+        # Set camera resolution explicitly for consistent bbox coordinates
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        self.logger.info("Camera thread started (640x480).")
+        consecutive_failures = 0
+        frame_interval = 1.0 / 15.0   # Target 15 FPS — no need to spin faster
+
         while not self.stop_event.is_set():
+            t0 = time.time()
             ok, frame = cap.read()
+
             if not ok:
-                self.logger.warning("Camera read failed.")
+                consecutive_failures += 1
+                if consecutive_failures == 5:
+                    self.logger.warning("Camera: 5 consecutive read failures. Check camera connection.")
+                    speak("Camera signal lost. Trying to recover.", priority="high", interrupt=True, category="safety")
+                if consecutive_failures > 30:
+                    self.logger.error("Camera: too many failures, stopping.")
+                    self.stop_event.set()
+                    break
+                time.sleep(0.1)
                 continue
+
+            consecutive_failures = 0
 
             if self.frame_queue.full():
                 try:
@@ -232,6 +275,12 @@ class RealTimeAISystem:
                 self.frame_queue.put_nowait(frame)
             except queue.Full:
                 pass
+
+            # Pace the camera loop to avoid CPU burn
+            elapsed = time.time() - t0
+            sleep_for = frame_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
         cap.release()
         self.logger.info("Camera thread stopped.")
@@ -377,12 +426,12 @@ class RealTimeAISystem:
 
     def _fallback_instruction(self, mode: AssistantMode, scene_text: str) -> str:
         if mode == AssistantMode.NAVIGATION:
-            return "Move slowly and keep slightly left while scanning ahead."
+            return "Keep going. Hug the left side and slow down slightly."
         if mode == AssistantMode.OBSTACLE_AWARENESS:
-            return "Pause and scan around before taking the next step."
+            return "Stop. Listen and feel the air before moving."
         if "no objects" in scene_text.lower():
-            return "Path seems clear. Move slowly and scan every two steps."
-        return "Move slowly and keep scanning for obstacles ahead."
+            return "Path ahead looks clear. Take two slow steps forward."
+        return "Something is nearby. Slow down and sweep your cane."
 
     def _sanitize_instruction(self, raw_text: str, mode: AssistantMode, scene_text: str) -> str:
         text = " ".join(str(raw_text).strip().split())
@@ -445,7 +494,10 @@ class RealTimeAISystem:
             return self._fallback_instruction(mode, scene_text)
 
         # Force actionable navigation-safe intent.
-        allowed_verbs = {"move", "step", "turn", "keep", "stop", "pause", "scan", "continue", "shift"}
+        allowed_verbs = {
+            "move", "step", "turn", "keep", "stop", "pause", "scan", "continue",
+            "shift", "slow", "go", "avoid", "clear", "watch", "ahead", "path",
+        }
         if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
             return self._fallback_instruction(mode, scene_text)
 
@@ -453,21 +505,23 @@ class RealTimeAISystem:
         return f"{cleaned}."
 
     def _obstacle_safety_assessment(self, enriched: List[Detection]) -> Tuple[bool, str]:
-        # Immediate hazard: near + center
+        # Immediate hazard: near + center — name the object so user knows what to avoid
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") == "center":
-                return True, "Careful, there is something right in front of you. Please stop for a moment."
-        # Immediate hazard: near + side
+                label = str(det.get("label", "object")).strip()
+                return True, f"{label.capitalize()} directly ahead. Stop now."
+        # Immediate hazard: near + side — name the object and give clear action
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") in {"left", "right"}:
+                label = str(det.get("label", "object")).strip()
                 side = det.get("position")
                 opposite = "right" if side == "left" else "left"
-                return True, f"There is an obstacle close on your {side}. Move a little to your {opposite}."
-        # Early warning: medium distance + center (approaching object)
+                return True, f"{label.capitalize()} close on your {side}. Step to your {opposite}."
+        # Early warning: medium + center — give extra reaction time
         for det in enriched:
             if det.get("distance") == "medium" and det.get("position") == "center":
                 label = str(det.get("label", "something")).strip()
-                return True, f"There is a {label} ahead at medium distance. Slow down."
+                return True, f"{label.capitalize()} ahead, a few steps away. Slow down."
         return False, ""
 
     def _scene_signature(self, enriched: List[Detection]) -> str:
@@ -571,24 +625,35 @@ class RealTimeAISystem:
         self._last_cloud_attempt_ts = time.time()
         try:
             cloud_text = call_cloud_api(scene_text, reason, mode.value)
+            self.logger.info(
+                "Cloud returned (%d chars): %s",
+                len(cloud_text),
+                cloud_text[:120] if cloud_text else "[EMPTY]",
+            )
         except Exception as exc:
             self.logger.error("Cloud API call failed: %s", exc)
             cloud_text = "failed"
 
         if self._is_cloud_failure_text(cloud_text):
-            self._cloud_failures += 1
-            if self._cloud_failures >= self.config.cloud_breaker_failure_threshold:
-                self._cloud_breaker_until_ts = time.time() + self.config.cloud_failure_cooldown_sec
-                self.logger.warning(
-                    "Cloud circuit opened for %.1fs after %s consecutive failures.",
-                    self.config.cloud_failure_cooldown_sec,
-                    self._cloud_failures,
-                )
+            # Only trip the breaker for genuine failures (network/auth), not empty content
+            is_hard_failure = cloud_text.strip().lower() in {"failed", "cloud api call failed"}
+            if is_hard_failure:
+                self._cloud_failures += 1
+                if self._cloud_failures >= self.config.cloud_breaker_failure_threshold:
+                    self._cloud_breaker_until_ts = time.time() + self.config.cloud_failure_cooldown_sec
+                    self.logger.warning(
+                        "Cloud circuit opened for %.1fs after %s consecutive failures.",
+                        self.config.cloud_failure_cooldown_sec,
+                        self._cloud_failures,
+                    )
+            else:
+                self.logger.warning("Cloud returned empty/unusable response for mode=%s — falling back to local.", mode.value)
 
             # Graceful degradation: reuse last valid cloud response for same scene if present.
             cached_sig = self._last_cloud_signature_by_mode.get(mode.value, "")
             cached_text = self._last_cloud_response_by_mode.get(mode.value, "")
             if cached_text and cached_sig == scene_signature:
+                self.logger.info("Reusing cached cloud response for same scene.")
                 return self._sanitize_instruction(cached_text, mode, scene_text)
             return None
 
@@ -810,7 +875,7 @@ class RealTimeAISystem:
 
                         now = time.time()
                         if not response_text and (now - self._last_mode_status_ts) >= self.config.mode_status_interval_sec:
-                            response_text = "Obstacle awareness is active. I am monitoring the area around you."
+                            response_text = "Area clear so far. Keep moving carefully."
                             source = "rule"
                             priority = "low"
                             self._last_mode_status_ts = now
@@ -828,11 +893,11 @@ class RealTimeAISystem:
                 # Keep user informed even in stable scenes via fast rules
                 if not response_text and not self._is_llm_running and (time.time() - self._last_spoken_ts) >= self.config.speech_keepalive_interval_sec:
                     if mode == AssistantMode.SCENE_DESCRIPTION and not major_scene_change:
-                        response_text = "Scene is stable. Move slowly and keep scanning ahead."
+                        response_text = "Still scanning. No new objects detected."
                         source = "rule"
                         priority = "low"
                     elif mode == AssistantMode.NAVIGATION and not major_scene_change:
-                        response_text = "Path seems unchanged. Continue slowly and scan ahead."
+                        response_text = "Path unchanged. Continue at your current pace."
                         source = "rule"
                         priority = "low"
 
