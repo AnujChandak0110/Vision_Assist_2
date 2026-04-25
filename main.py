@@ -68,6 +68,8 @@ class RealTimeAISystem:
         self.voice_listener = VoiceCommandListener()
 
         self._state_lock = threading.Lock()
+        self._llm_lock = threading.Lock()
+        self._is_llm_running = False
         self._mode = AssistantMode.SCENE_DESCRIPTION
 
         self._route_origin: Optional[str] = None
@@ -234,6 +236,59 @@ class RealTimeAISystem:
         cap.release()
         self.logger.info("Camera thread stopped.")
 
+    def _async_llm_worker(self, mode: AssistantMode, scene_text: str, enriched: List[Detection], avg_conf: float, recompute: bool, scene_signature: str, major_scene_change: bool, complex_environment: bool, cloud_needed: bool) -> None:
+        try:
+            response_text = ""
+            source = ""
+            priority = "low"
+            interrupt = False
+
+            if mode == AssistantMode.OBSTACLE_AWARENESS:
+                if recompute and major_scene_change:
+                    response_text = self._local_fast_response(mode, scene_text, enriched, avg_conf)
+                    source = "local_llm"
+                    priority = "medium"
+
+                cloud_text = self._call_cloud_with_guardrails(mode, scene_text, "long_term_context", scene_signature, recompute, major_scene_change, complex_environment, cloud_needed)
+                if cloud_text:
+                    response_text = cloud_text
+                    source = "cloud"
+
+            elif mode == AssistantMode.SCENE_DESCRIPTION:
+                response_text, source = self._scene_cloud_response(scene_text, enriched, avg_conf, mode, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed)
+                priority = "low"
+
+            elif mode == AssistantMode.NAVIGATION:
+                response_text, source, priority, interrupt = self._navigation_response(scene_text, enriched, avg_conf, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed)
+
+            elif mode in {AssistantMode.OBJECT_FINDER, AssistantMode.TEXT_READING}:
+                if recompute and major_scene_change:
+                    scene_data = {
+                        "mode": mode.value,
+                        "scene": scene_text,
+                        "detections": enriched,
+                        "instruction_style": "one short safe instruction, no reasoning",
+                    }
+                    from llm.ollama_local import query_ollama
+                    response_text = query_ollama(scene_data)
+                    source = "local_llm"
+                    priority = "low"
+
+            if response_text and source != "rule":
+                response_text = self._sanitize_instruction(response_text, mode, scene_text)
+
+            if response_text:
+                category = "safety" if priority == "high" else ("navigation" if mode == AssistantMode.NAVIGATION else "scene")
+                queued = speak(response_text, priority=priority, interrupt=interrupt, category=category)
+                if queued:
+                    self._last_spoken_ts = time.time()
+                self.logger.info("async_llm: mode=%s source=%s conf=%.3f queued=%s", mode.value, source, avg_conf, queued)
+        except Exception as exc:
+            self.logger.error("Async LLM error: %s", exc)
+        finally:
+            with self._llm_lock:
+                self._is_llm_running = False
+
     def _enrich_detections(self, detections: List[Detection]) -> List[Detection]:
         enriched: List[Detection] = []
         for det in detections:
@@ -273,16 +328,14 @@ class RealTimeAISystem:
     def _is_major_scene_change(prev_sig: Set[Tuple[str, str, str]], curr_sig: Set[Tuple[str, str, str]]) -> bool:
         if not prev_sig and curr_sig:
             return True
-        if prev_sig == curr_sig:
-            return False
 
-        # Any object appear/disappear, position change, or near/far change is major.
+        # Only trigger major changes when object classes (labels) appear or disappear.
+        # This prevents bounding-box jitter (distance/position flickering) from constantly
+        # triggering the AI models and causing API 429 Rate Limits.
         prev_labels = {label for label, _, _ in prev_sig}
         curr_labels = {label for label, _, _ in curr_sig}
-        if prev_labels != curr_labels:
-            return True
-
-        return True
+        
+        return prev_labels != curr_labels
 
     @staticmethod
     def _is_complex_environment(enriched: List[Detection]) -> bool:
@@ -300,8 +353,15 @@ class RealTimeAISystem:
         avg_conf: float,
         enriched: List[Detection],
     ) -> bool:
-        if not major_scene_change:
+        now = time.time()
+        dwell_time = now - getattr(self, "_last_major_change_ts", now)
+        is_stable_scene_description = (mode == AssistantMode.SCENE_DESCRIPTION) and (dwell_time >= 4.0)
+
+        if not major_scene_change and not is_stable_scene_description:
             return False
+
+        if is_stable_scene_description:
+            return True
 
         high_detail = len(enriched) >= self.config.cloud_high_detail_object_threshold
         low_conf = avg_conf < self.config.cloud_low_confidence_threshold
@@ -438,15 +498,22 @@ class RealTimeAISystem:
         prev_sig = self._last_cloud_signature_by_mode.get(mode.value, "")
         scene_changed = prev_sig != scene_signature
 
-        # Cloud only on major scene changes or periodic context for complex scenes.
-        if not major_scene_change and not (periodic_due and complex_environment):
+        dwell_time = now - getattr(self, "_last_major_change_ts", now)
+        is_stable_scene_description = (mode == AssistantMode.SCENE_DESCRIPTION) and (dwell_time >= 4.0)
+        
+        # Prevent spam: if we already asked the cloud for this exact scene signature, don't ask again just because we are dwelling.
+        if not scene_changed:
+            is_stable_scene_description = False
+
+        # Cloud only on major scene changes, periodic context, or long stable dwell times.
+        if not major_scene_change and not (periodic_due and complex_environment) and not is_stable_scene_description:
             return False
 
         # If detections were not recomputed and no periodic sync is due, skip cloud.
-        if not recompute and not periodic_due:
+        if not recompute and not periodic_due and not is_stable_scene_description:
             return False
 
-        if not scene_changed and not periodic_due:
+        if not scene_changed and not periodic_due and not is_stable_scene_description:
             return False
 
         return True
@@ -475,7 +542,11 @@ class RealTimeAISystem:
             return None
 
         self._last_cloud_attempt_ts = time.time()
-        cloud_text = call_cloud_api(scene_text, reason, mode.value)
+        try:
+            cloud_text = call_cloud_api(scene_text, reason, mode.value)
+        except Exception as exc:
+            self.logger.error("Cloud API call failed: %s", exc)
+            cloud_text = "failed"
 
         if self._is_cloud_failure_text(cloud_text):
             self._cloud_failures += 1
@@ -697,34 +768,14 @@ class RealTimeAISystem:
                         priority = "high"
                         interrupt = True
                     else:
-                        if recompute and major_scene_change:
-                            response_text = self._local_fast_response(
-                                AssistantMode.OBSTACLE_AWARENESS,
-                                scene_text,
-                                enriched,
-                                avg_conf,
-                            )
-                            response_text = self._sanitize_instruction(
-                                response_text,
-                                AssistantMode.OBSTACLE_AWARENESS,
-                                scene_text,
-                            )
-                            source = "local_llm"
-                            priority = "medium"
-
-                        cloud_text = self._call_cloud_with_guardrails(
-                            mode=AssistantMode.OBSTACLE_AWARENESS,
-                            scene_text=scene_text,
-                            reason="long_term_context",
-                            scene_signature=scene_signature,
-                            recompute=recompute,
-                            major_scene_change=major_scene_change,
-                            complex_environment=complex_environment,
-                            cloud_needed=cloud_needed,
-                        )
-                        if cloud_text:
-                            response_text = cloud_text
-                            source = "cloud"
+                        with self._llm_lock:
+                            if not self._is_llm_running:
+                                self._is_llm_running = True
+                                threading.Thread(
+                                    target=self._async_llm_worker,
+                                    args=(mode, scene_text, enriched, avg_conf, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed),
+                                    daemon=True
+                                ).start()
 
                         now = time.time()
                         if not response_text and (now - self._last_mode_status_ts) >= self.config.mode_status_interval_sec:
@@ -732,48 +783,19 @@ class RealTimeAISystem:
                             source = "rule"
                             priority = "low"
                             self._last_mode_status_ts = now
-                elif mode == AssistantMode.SCENE_DESCRIPTION:
-                    # Scene description mode policy: priority cloud for richer contextual accuracy.
-                    response_text, source = self._scene_cloud_response(
-                        scene_text,
-                        enriched,
-                        avg_conf,
-                        mode,
-                        recompute,
-                        scene_signature,
-                        major_scene_change,
-                        complex_environment,
-                        cloud_needed,
-                    )
-                    priority = "low"
-                elif mode == AssistantMode.NAVIGATION:
-                    response_text, source, priority, interrupt = self._navigation_response(
-                        scene_text,
-                        enriched,
-                        avg_conf,
-                        recompute,
-                        scene_signature,
-                        major_scene_change,
-                        complex_environment,
-                        cloud_needed,
-                    )
-                elif mode in {AssistantMode.OBJECT_FINDER, AssistantMode.TEXT_READING}:
-                    if recompute and major_scene_change:
-                        scene_data = {
-                            "mode": mode.value,
-                            "scene": scene_text,
-                            "detections": enriched,
-                            "instruction_style": "one short safe instruction, no reasoning",
-                        }
-                        response_text = self._sanitize_instruction(query_ollama(scene_data), mode, scene_text)
-                        source = "local_llm"
-                        priority = "low"
+                else:
+                    # For all other modes, dispatch to async LLM
+                    with self._llm_lock:
+                        if not self._is_llm_running:
+                            self._is_llm_running = True
+                            threading.Thread(
+                                target=self._async_llm_worker,
+                                args=(mode, scene_text, enriched, avg_conf, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed),
+                                daemon=True
+                            ).start()
 
-                if response_text and source != "rule":
-                    response_text = self._sanitize_instruction(response_text, mode, scene_text)
-
-                # Keep user informed even in stable scenes, but with long cooldown.
-                if not response_text and (time.time() - self._last_spoken_ts) >= self.config.speech_keepalive_interval_sec:
+                # Keep user informed even in stable scenes via fast rules
+                if not response_text and not self._is_llm_running and (time.time() - self._last_spoken_ts) >= self.config.speech_keepalive_interval_sec:
                     if mode == AssistantMode.SCENE_DESCRIPTION and not major_scene_change:
                         response_text = "Scene is stable. Move slowly and keep scanning ahead."
                         source = "rule"
