@@ -413,7 +413,22 @@ class RealTimeAISystem:
         if any(token in lowered for token in unsafe):
             return self._fallback_instruction(mode, scene_text)
 
-        # Keep exactly one short sentence.
+        # Scene description mode: allow rich multi-sentence output from Gemini
+        if mode == AssistantMode.SCENE_DESCRIPTION:
+            # Just clean special characters and cap length
+            cleaned = re.sub(r"[^a-zA-Z0-9,.\-\s!?;:']", "", text)
+            cleaned = " ".join(cleaned.split())
+            words = cleaned.split()
+            if len(words) < 4:
+                return self._fallback_instruction(mode, scene_text)
+            if any(len(w) > 16 for w in words):
+                return self._fallback_instruction(mode, scene_text)
+            # Cap at ~60 words to keep TTS reasonable
+            if len(words) > 60:
+                cleaned = " ".join(words[:60])
+            return cleaned
+
+        # Navigation/obstacle modes: keep exactly one short sentence.
         parts = re.split(r"(?<=[.!?])\s+", text)
         sentence = parts[0].strip(" .!?")
         sentence = re.sub(r"[^a-zA-Z0-9,\-\s]", "", sentence)
@@ -429,24 +444,30 @@ class RealTimeAISystem:
         if any(len(w) > 16 for w in sentence.split()):
             return self._fallback_instruction(mode, scene_text)
 
-        # Force actionable navigation-safe intent (unless describing the scene).
-        if mode != AssistantMode.SCENE_DESCRIPTION:
-            allowed_verbs = {"move", "step", "turn", "keep", "stop", "pause", "scan", "continue", "shift"}
-            if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
-                return self._fallback_instruction(mode, scene_text)
+        # Force actionable navigation-safe intent.
+        allowed_verbs = {"move", "step", "turn", "keep", "stop", "pause", "scan", "continue", "shift"}
+        if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
+            return self._fallback_instruction(mode, scene_text)
 
         cleaned = sentence[0].upper() + sentence[1:] if sentence else sentence
         return f"{cleaned}."
 
     def _obstacle_safety_assessment(self, enriched: List[Detection]) -> Tuple[bool, str]:
+        # Immediate hazard: near + center
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") == "center":
                 return True, "Careful, there is something right in front of you. Please stop for a moment."
+        # Immediate hazard: near + side
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") in {"left", "right"}:
                 side = det.get("position")
                 opposite = "right" if side == "left" else "left"
                 return True, f"There is an obstacle close on your {side}. Move a little to your {opposite}."
+        # Early warning: medium distance + center (approaching object)
+        for det in enriched:
+            if det.get("distance") == "medium" and det.get("position") == "center":
+                label = str(det.get("label", "something")).strip()
+                return True, f"There is a {label} ahead at medium distance. Slow down."
         return False, ""
 
     def _scene_signature(self, enriched: List[Detection]) -> str:
@@ -473,7 +494,13 @@ class RealTimeAISystem:
         lowered = text.strip().lower()
         if not lowered:
             return True
-        return "unavailable" in lowered or "failed" in lowered
+        # Only match exact failure phrases from our own fallback strings
+        failure_phrases = [
+            "cloud guidance unavailable",
+            "cloud api call failed",
+            "failed",
+        ]
+        return any(lowered == phrase or lowered.startswith(phrase) for phrase in failure_phrases)
 
     def _cloud_allowed_by_guardrails(
         self,
@@ -598,6 +625,10 @@ class RealTimeAISystem:
             return cloud_text, "cloud"
 
         if not recompute or not major_scene_change:
+            # Still provide local description if objects exist in the scene
+            if enriched:
+                local_text = self._local_fast_response(mode, scene_text, enriched, avg_conf)
+                return self._sanitize_instruction(local_text, mode, scene_text), "local_llm"
             return "", "local_llm"
 
         local_text = self._local_fast_response(mode, scene_text, enriched, avg_conf)

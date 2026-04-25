@@ -13,6 +13,9 @@ from typing import Dict, List, Tuple
 
 import pyttsx3
 
+# Shared flag so voice listener can pause while TTS is speaking
+_tts_speaking_event = threading.Event()
+
 
 class Priority(IntEnum):
     HIGH = 0
@@ -65,6 +68,7 @@ def _tts_process_worker(ipc_queue: multiprocessing.Queue, rate: int, volume: flo
         if text is None:
             break
         try:
+            _tts_speaking_event.set()
             print(f"\n[TTS SPEAKING] -> {text}\n")
             speaker.Speak(text)
         except Exception as exc:
@@ -77,6 +81,8 @@ def _tts_process_worker(ipc_queue: multiprocessing.Queue, rate: int, volume: flo
                 speaker.Rate = sapi_rate
             except Exception:
                 pass
+        finally:
+            _tts_speaking_event.clear()
 
 class TextToSpeech:
     """Threaded speech engine with urgency-aware delivery controls."""
@@ -94,7 +100,7 @@ class TextToSpeech:
         self._last_any_ts: float = 0.0
 
         # Set up IPC queue (worker will be started explicitly)
-        self._ipc_queue = multiprocessing.Queue(maxsize=1)
+        self._ipc_queue = multiprocessing.Queue(maxsize=5)
         self._worker_process = None
         self._pump_thread = None
 
@@ -237,6 +243,10 @@ def start_tts():
 def speak(text: str, priority: str = "medium", interrupt: bool = False, category: str = "general") -> bool:
     """Queue speech asynchronously with priority and dedup controls."""
     return _tts.speak(text, priority=priority, interrupt=interrupt, category=category)
+
+def is_speaking() -> bool:
+    """Return True if the TTS engine is currently speaking audio."""
+    return _tts_speaking_event.is_set()
 
 
 if __name__ == "__main__":

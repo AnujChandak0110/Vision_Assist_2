@@ -32,7 +32,16 @@ class DetectorConfig:
     model_name: str = "yolov8n.pt"
     image_size: int = 416
     confidence_threshold: float = 0.5
-    allowed_labels: Tuple[str, ...] = ("person", "chair", "bottle", "cup")
+    allowed_labels: Tuple[str, ...] = (
+        "person", "bicycle", "car", "motorcycle", "bus", "truck",
+        "traffic light", "stop sign", "fire hydrant",
+        "bench", "cat", "dog", "horse",
+        "backpack", "umbrella", "handbag", "suitcase",
+        "chair", "couch", "bed", "dining table", "toilet",
+        "laptop", "cell phone", "book",
+        "bottle", "cup", "fork", "knife", "scissors",
+        "potted plant", "vase",
+    )
     skip_frames: int = 0
     debug: bool = False
 

@@ -23,7 +23,7 @@ from requests.exceptions import Timeout
 
 DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "llama3.2:1b"
-DEFAULT_TIMEOUT_SECONDS = 25
+DEFAULT_TIMEOUT_SECONDS = 8
 DEFAULT_MAX_RESPONSE_CHARS = 160
 
 

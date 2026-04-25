@@ -28,12 +28,13 @@ GEMINI_ENDPOINT_TEMPLATE: Final[str] = (
 )
 
 DEFAULT_OPENAI_MODEL: Final[str] = "gpt-4o"
-DEFAULT_GEMINI_MODEL: Final[str] = "gemini-2.5-flash"
-DEFAULT_TIMEOUT_SECONDS: Final[int] = 10
+DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3-flash-preview"
+DEFAULT_TIMEOUT_SECONDS: Final[int] = 8
 DEFAULT_MAX_CHARS: Final[int] = 160
-MAX_RETRIES: Final[int] = 3
+SCENE_DESC_MAX_CHARS: Final[int] = 500
+MAX_RETRIES: Final[int] = 1
 BACKOFF_BASE_SECONDS: Final[float] = 1.0
-BACKOFF_MAX_SECONDS: Final[float] = 8.0
+BACKOFF_MAX_SECONDS: Final[float] = 2.0
 RETRYABLE_STATUS_CODES: Final[set[int]] = {429, 500, 502, 503, 504}
 
 ALLOWED_REASONS: Final[set[str]] = {
@@ -92,11 +93,13 @@ _load_local_env_files()
 
 def _trim_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     cleaned = " ".join(text.strip().split())
-    # Keep first sentence only for stable speech output.
-    for sep in (".", "!", "?"):
-        if sep in cleaned:
-            cleaned = cleaned.split(sep, 1)[0].strip()
-            break
+
+    # For short navigation text, keep first sentence only.
+    if max_chars <= DEFAULT_MAX_CHARS:
+        for sep in (".", "!", "?"):
+            if sep in cleaned:
+                cleaned = cleaned.split(sep, 1)[0].strip()
+                break
 
     if len(cleaned) <= max_chars:
         return cleaned
@@ -130,12 +133,16 @@ def build_prompt(scene: str, reason: str, mode: str = "navigation") -> str:
 
     if mode == "scene_description":
         return (
-            "You are an assistant for a blind user. "
-            "Return exactly one short sentence describing the scene in front of the user. "
-            "Prioritize naming objects, their positions, and distances. "
-            "No explanation, no reasoning, max 14 words. "
+            "You are an assistant for a visually impaired user who cannot see anything. "
+            "Describe the scene in front of them in vivid, helpful detail. "
+            "Include: what objects are present, their approximate positions (left, center, right), "
+            "how far away they are (near, medium, far), colors if relevant, "
+            "the type of environment (indoor room, outdoor sidewalk, corridor, etc.), "
+            "lighting conditions, and any potential hazards or obstacles. "
+            "Use natural, conversational language as if you are their eyes. "
+            "Keep it to 3-4 sentences maximum. "
             "Never suggest approaching or following people. "
-            f"Scene: {scene.strip()}"
+            f"Scene data: {scene.strip()}"
         )
 
     return (
@@ -239,7 +246,7 @@ def _call_openai(prompt: str) -> str:
     return str(content).strip()
 
 
-def _call_gemini(prompt: str) -> str:
+def _call_gemini(prompt: str, mode: str = "navigation") -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -247,11 +254,14 @@ def _call_gemini(prompt: str) -> str:
     model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
     endpoint = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
 
+    # Scene description gets more tokens for rich, detailed output
+    max_tokens = 200 if mode == "scene_description" else 60
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 60,
+            "temperature": 0.3 if mode == "scene_description" else 0.2,
+            "maxOutputTokens": max_tokens,
         },
     }
 
@@ -290,15 +300,18 @@ def call_cloud_api(scene: str, reason: str, mode: str = "navigation") -> str:
     prompt = build_prompt(scene, reason, mode)
     provider = os.getenv("CLOUD_PROVIDER", "gemini").strip().lower()
 
+    # Scene descriptions get a higher character limit for rich output
+    trim_limit = SCENE_DESC_MAX_CHARS if mode == "scene_description" else DEFAULT_MAX_CHARS
+
     try:
         if provider == "gemini":
-            LOGGER.info("Using cloud provider: gemini")
-            result = _call_gemini(prompt)
+            LOGGER.info("Using cloud provider: gemini (mode=%s)", mode)
+            result = _call_gemini(prompt, mode=mode)
         else:
             LOGGER.info("Using cloud provider: openai")
             result = _call_openai(prompt)
 
-        return _trim_text(result)
+        return _trim_text(result, max_chars=trim_limit)
 
     except (RequestException, RuntimeError, ValueError) as exc:
         LOGGER.error("Cloud API call failed: %s", exc)

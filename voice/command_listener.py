@@ -140,6 +140,15 @@ class VoiceCommandListener:
                 self.logger.warning("Ambient noise calibration failed: %s", exc)
 
             while not self._stop_event.is_set():
+                # Skip listening while TTS is speaking to avoid mic feedback
+                try:
+                    from audio.tts import is_speaking
+                    if is_speaking():
+                        time.sleep(0.1)
+                        continue
+                except ImportError:
+                    pass
+
                 try:
                     audio = self._recognizer.listen(
                         source,
