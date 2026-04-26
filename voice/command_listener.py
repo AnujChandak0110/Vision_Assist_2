@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -91,8 +92,46 @@ class VoiceCommandListener:
         if normalized:
             self._commands.put(normalized)
 
+    @staticmethod
+    def _compact_lower(text: str) -> str:
+        return " ".join(text.strip().lower().split())
+
+    @staticmethod
+    def _contains_any(text: str, phrases: list[str]) -> bool:
+        return any(phrase in text for phrase in phrases)
+
+    def _strip_wake_word(self, text: str) -> str:
+        wake = self.config.wake_word.strip().lower()
+        if not wake:
+            return text
+        if text.startswith(wake + " "):
+            return text[len(wake):].strip(" ,")
+        return text.replace(wake, "", 1).strip(" ,") if wake in text else text
+
+    def _parse_route_command(self, text: str) -> Optional[str]:
+        from_to = re.search(
+            r"(?:navigate|guid(e|ing)|take me|walk|go|route)\s+(?:me\s+)?from\s+(.+?)\s+to\s+(.+)$",
+            text,
+        )
+        if from_to:
+            origin = from_to.group(2).strip()
+            destination = from_to.group(3).strip()
+            if origin and destination:
+                return f"route:navigate from {origin} to {destination}"
+
+        to_only = re.search(
+            r"(?:navigate|guid(e|ing)|take me|walk|go|route)\s+(?:me\s+)?to\s+(.+)$",
+            text,
+        )
+        if to_only:
+            destination = to_only.group(2).strip()
+            if destination:
+                return f"route_to:{destination}"
+
+        return None
+
     def _normalize_command(self, text: str) -> Optional[str]:
-        lowered = " ".join(text.strip().lower().split())
+        lowered = self._compact_lower(text)
         if not lowered:
             return None
 
@@ -100,26 +139,77 @@ class VoiceCommandListener:
         if self.config.require_wake_word and wake and wake not in lowered:
             return None
 
-        # Remove wake-word prefix if present.
-        if wake and wake in lowered:
-            lowered = lowered.replace(wake, "", 1).strip(" ,")
+        lowered = self._strip_wake_word(lowered)
+        lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+        lowered = self._compact_lower(lowered)
+        if not lowered:
+            return None
 
-        if "scene" in lowered and "description" in lowered:
-            return "scene_description"
-        if "navigation" in lowered:
-            return "navigation"
-        if "obstacle" in lowered:
-            return "obstacle_awareness"
-        if lowered in {"stop", "pause"} or "stop" in lowered or "pause" in lowered:
+        pause_phrases = ["stop", "pause", "hold on", "wait", "be quiet", "silence"]
+        if self._contains_any(lowered, pause_phrases):
             return "pause"
 
-        # Optional map navigation command:
-        # assistant navigate from home to office
-        if lowered.startswith("navigate from ") and " to " in lowered:
-            return f"route:{lowered}"
+        resume_phrases = ["resume", "continue", "go on", "keep going", "start again"]
+        if self._contains_any(lowered, resume_phrases):
+            return "resume"
+
+        rescan_phrases = [
+            "scan again",
+            "rescan",
+            "look around",
+            "check around",
+            "full scan",
+            "scan the room",
+        ]
+        if self._contains_any(lowered, rescan_phrases):
+            return "rescan"
+
+        route_cmd = self._parse_route_command(lowered)
+        if route_cmd:
+            return route_cmd
+
+        obstacle_phrases = [
+            "obstacle",
+            "watch out",
+            "hazard",
+            "safety mode",
+            "avoid collisions",
+            "collision",
+        ]
+        if self._contains_any(lowered, obstacle_phrases):
+            return "obstacle_awareness"
+
+        navigation_phrases = [
+            "navigation",
+            "guide me",
+            "help me walk",
+            "way out",
+            "exit",
+            "lead me",
+            "take me",
+        ]
+        if self._contains_any(lowered, navigation_phrases):
+            return "navigation"
+
+        scene_phrases = [
+            "scene description",
+            "describe",
+            "what is around me",
+            "what do you see",
+            "surroundings",
+            "environment",
+            "look mode",
+        ]
+        if self._contains_any(lowered, scene_phrases):
+            return "scene_description"
 
         if lowered.startswith("switch to "):
             target = lowered.replace("switch to ", "", 1).strip()
+            if target:
+                return f"app_switch:{target}"
+
+        if lowered.startswith("open "):
+            target = lowered.replace("open ", "", 1).replace(" mode", "").strip()
             if target:
                 return f"app_switch:{target}"
 
@@ -140,9 +230,8 @@ class VoiceCommandListener:
                 self.logger.warning("Ambient noise calibration failed: %s", exc)
 
             while not self._stop_event.is_set():
-                # During TTS playback, use a shorter phrase limit so we quickly
-                # check for interrupt commands without long blocking waits.
-                # The mic stays ACTIVE so the user can always interrupt.
+                # During TTS playback, use shorter windows so user interrupt
+                # commands are captured quickly.
                 try:
                     from audio.tts import is_speaking
                     tts_active = is_speaking()

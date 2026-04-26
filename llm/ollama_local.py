@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -24,7 +25,7 @@ from requests.exceptions import Timeout
 DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "llama3.2:1b"
 DEFAULT_TIMEOUT_SECONDS = 8
-DEFAULT_MAX_RESPONSE_CHARS = 160
+DEFAULT_MAX_RESPONSE_CHARS = 220
 
 
 @dataclass
@@ -66,43 +67,48 @@ def build_prompt(scene_data: Dict[str, Any]) -> str:
 
     if mode == "scene_description":
         return (
-            "You are the eyes of a blind person. "
-            "Name the objects you see, their position (left/center/right), and how far they are (near/medium/far). "
-            "One sentence per key object. Max 2 sentences total. "
-            "Example: 'Chair on your left, arm's reach. Clear path ahead.' "
-            "No reasoning. No extra words. "
+            "You are a calm human guide walking beside a blind person. "
+            "Use warm, natural spoken language. "
+            "Describe the scene clearly with clock directions and distance in steps. "
+            "Example style: 'There is a chair around 10 o'clock, about one step away. The space near 12 o'clock looks open for a few steps.' "
+            "Keep it practical and reassuring. Max 2 short sentences. "
+            "No reasoning text and no technical wording. "
             f"Camera data: {compact_scene}"
         )
 
     if mode == "obstacle_awareness":
         return (
-            "You are guiding a blind person who is moving. "
-            "Look at the camera data. Give ONE action sentence. "
-            "Name the most important object, its side (left/center/right), and say near or medium. "
-            "If clear, say: Path clear, continue forward. "
-            "Max 10 words. No explanation. "
+            "You are a careful human spotter guiding a blind person in motion. "
+            "Give ONE short action sentence with clock direction and distance in steps. "
+            "Use phrasing like: stop, shift slightly left, two small steps forward. "
+            "If clear, say the path is clear and suggest one gentle next step. "
+            "Max 16 words. No explanations. "
             f"Camera data: {compact_scene}"
         )
 
     # navigation default
     return (
-        "You are guiding a blind person who is walking. "
-        "Give ONE spoken instruction for the next step. "
-        "Name obstacles with side (left/center/right) and distance (near/medium/far). "
-        "Use: stop, step left, shift right, continue, slow down. "
-        "Max 10 words. No reasoning. "
-        "Example: 'Bottle on your right, step left.' "
+        "You are a warm human mobility guide helping a blind person walk safely. "
+        "Give ONE spoken step for the next 2-3 seconds. "
+        "Use clock directions and step counts when possible. "
+        "Preferred style: 'Person near 1 o'clock, shift a little left and take one small step.' "
+        "Max 18 words. No reasoning. "
         f"Camera data: {compact_scene}"
     )
 
 
-def _trim_response(text: str, max_chars: int) -> str:
+def _trim_response(text: str, max_chars: int, single_sentence: bool = True) -> str:
     cleaned = " ".join(text.strip().split())
-    # Keep a single sentence to avoid long or malformed spoken output.
-    for sep in (".", "!", "?"):
-        if sep in cleaned:
-            cleaned = cleaned.split(sep, 1)[0].strip()
-            break
+    if single_sentence:
+        # Keep a single sentence to avoid long or malformed spoken output.
+        for sep in (".", "!", "?"):
+            if sep in cleaned:
+                cleaned = cleaned.split(sep, 1)[0].strip()
+                break
+    else:
+        # Keep at most two spoken sentences for richer scene explanation.
+        parts = re.split(r"(?<=[.!?])\s+", cleaned)
+        cleaned = " ".join(parts[:2]).strip()
 
     if len(cleaned) <= max_chars:
         return cleaned
@@ -140,7 +146,10 @@ def query_ollama(scene_data: Dict[str, Any], config: OllamaConfig | None = None)
             LOGGER.warning("Empty response from Ollama.")
             return "Pause and scan surroundings again."
 
-        return _trim_response(text, cfg.max_response_chars)
+        mode = str(scene_data.get("mode", "navigation")).strip().lower()
+        if mode == "scene_description":
+            return _trim_response(text, max(cfg.max_response_chars, 260), single_sentence=False)
+        return _trim_response(text, cfg.max_response_chars, single_sentence=True)
 
     except Timeout:
         LOGGER.warning("Ollama request timed out after %ss", cfg.timeout_seconds)

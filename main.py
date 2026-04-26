@@ -66,6 +66,16 @@ class RuntimeConfig:
     speech_keepalive_interval_sec: float = 12.0
     cloud_low_confidence_threshold: float = 0.45
     cloud_high_detail_object_threshold: int = 5
+    scan_hold_seconds: float = 2.8
+    navigation_scan_stale_sec: float = 90.0
+    scan_heading_labels: Tuple[str, ...] = (
+        "12 o'clock",
+        "2 o'clock",
+        "4 o'clock",
+        "6 o'clock",
+        "8 o'clock",
+        "10 o'clock",
+    )
 
 
 class RealTimeAISystem:
@@ -92,6 +102,7 @@ class RealTimeAISystem:
         self._llm_lock = threading.Lock()
         self._is_llm_running = False
         self._mode = AssistantMode.SCENE_DESCRIPTION
+        self._previous_mode = AssistantMode.SCENE_DESCRIPTION
 
         self._route_origin: Optional[str] = None
         self._route_destination: Optional[str] = None
@@ -113,6 +124,15 @@ class RealTimeAISystem:
         self._last_semantic_scene: Set[Tuple[str, str, str]] = set()
         self._last_major_change_ts = 0.0
         self._last_spoken_ts = 0.0
+
+        self._scan_active = False
+        self._scan_purpose = "startup"
+        self._scan_heading_index = 0
+        self._scan_prompted_index = -1
+        self._scan_step_started_ts = 0.0
+        self._scan_snapshots: Dict[str, List[Tuple[str, str, str]]] = {}
+        self._spatial_memory: Dict[str, List[Tuple[str, str, str]]] = {}
+        self._scan_last_completed_ts = 0.0
 
         self._camera_thread = threading.Thread(target=self._camera_loop, name="camera-thread", daemon=True)
         self._inference_thread = threading.Thread(target=self._inference_loop, name="inference-thread", daemon=True)
@@ -137,12 +157,14 @@ class RealTimeAISystem:
         self.logger.info("Starting wearable assistant pipeline.")
         start_tts()
         speak(
-            "Assistant is ready. I can see for you. Say scene description, navigation, or obstacle awareness to begin.",
+            "I am with you and ready to guide. Say scene mode, navigation, or obstacle mode anytime.",
             priority="medium",
             category="system",
         )
 
-        if not self.voice_listener.is_available():
+        if self.voice_listener.is_available():
+            speak("I am listening. You can interrupt me anytime with assistant.", priority="low", category="system")
+        else:
             speak(
                 "Microphone not found. Camera guidance is still active.",
                 priority="medium",
@@ -152,6 +174,7 @@ class RealTimeAISystem:
         self.voice_listener.start()
         self._camera_thread.start()
         self._inference_thread.start()
+        self._start_environment_scan("startup", force=True)
 
         try:
             while not self.stop_event.is_set():
@@ -176,6 +199,18 @@ class RealTimeAISystem:
             self._apply_voice_command(cmd)
 
     def _apply_voice_command(self, cmd: str) -> None:
+        if cmd == "rescan":
+            purpose = "navigation" if self._mode == AssistantMode.NAVIGATION else "startup"
+            self._start_environment_scan(purpose, force=True)
+            return
+
+        if cmd == "resume":
+            with self._state_lock:
+                if self._mode == AssistantMode.PAUSED:
+                    self._mode = self._previous_mode
+            speak("Back with you. Continuing guidance now.", priority="medium", category="system")
+            return
+
         if cmd.startswith("app_switch:"):
             app_name = cmd.split(":", 1)[1].strip()
             if app_name:
@@ -199,12 +234,34 @@ class RealTimeAISystem:
                 self._route_origin = origin
                 self._route_destination = destination
                 self._mode = AssistantMode.NAVIGATION
+                self._previous_mode = AssistantMode.NAVIGATION
 
             speak(
-                f"Navigation mode enabled. Getting a walking route from {origin} to {destination}.",
+                f"Navigation is on. I will guide you from {origin} to {destination}.",
                 priority="medium",
                 category="navigation",
             )
+            self._start_environment_scan("navigation", force=True)
+            return
+
+        if cmd.startswith("route_to:"):
+            destination = cmd.split(":", 1)[1].strip()
+            if not destination:
+                speak("I heard navigation, but not the destination. Please say it again.", category="system")
+                return
+
+            with self._state_lock:
+                self._route_origin = "current location"
+                self._route_destination = destination
+                self._mode = AssistantMode.NAVIGATION
+                self._previous_mode = AssistantMode.NAVIGATION
+
+            speak(
+                f"Okay, we will head to {destination}. First, let us scan the full space around you.",
+                priority="medium",
+                category="navigation",
+            )
+            self._start_environment_scan("navigation", force=True)
             return
 
         mapping = {
@@ -219,12 +276,16 @@ class RealTimeAISystem:
 
         with self._state_lock:
             self._mode = mode
+            if mode != AssistantMode.PAUSED:
+                self._previous_mode = mode
 
         if mode == AssistantMode.PAUSED:
             speak("Pausing guidance. Say assistant and a mode command to continue.", priority="medium", category="system")
         else:
             readable = mode.value.replace("_", " ")
-            speak(f"Mode selected: {readable}.", priority="medium", category="system")
+            speak(f"Okay, {readable} mode is active.", priority="medium", category="system")
+            if mode == AssistantMode.NAVIGATION and self._scan_is_stale():
+                self._start_environment_scan("navigation", force=True)
 
     def _camera_loop(self) -> None:
         # Use DirectShow on Windows for faster USB webcam init and stable reads
@@ -351,6 +412,152 @@ class RealTimeAISystem:
             enriched.append(entry)
         return enriched
 
+    def _scan_is_stale(self) -> bool:
+        if not self._spatial_memory:
+            return True
+        return (time.time() - self._scan_last_completed_ts) >= self.config.navigation_scan_stale_sec
+
+    def _start_environment_scan(self, purpose: str, force: bool = False) -> None:
+        if self._scan_active and not force:
+            return
+
+        if purpose == "navigation" and not force and not self._scan_is_stale():
+            return
+
+        self._scan_active = True
+        self._scan_purpose = purpose
+        self._scan_heading_index = 0
+        self._scan_prompted_index = -1
+        self._scan_step_started_ts = 0.0
+        self._scan_snapshots = {}
+
+        if purpose == "navigation":
+            speak(
+                "Before we move, let us do a quick full scan. Turn slowly with me so I can map safe directions.",
+                priority="medium",
+                category="navigation",
+            )
+        else:
+            speak(
+                "Let us begin fresh. Please turn slowly in a full circle while I learn your surroundings.",
+                priority="medium",
+                category="system",
+            )
+
+    @staticmethod
+    def _compact_scan_snapshot(enriched: List[Detection]) -> List[Tuple[str, str, str]]:
+        rank = {"near": 0, "medium": 1, "far": 2}
+        compact: List[Tuple[str, str, str]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        sorted_enriched = sorted(
+            enriched,
+            key=lambda d: rank.get(str(d.get("distance", "far")).lower(), 2),
+        )
+        for det in sorted_enriched:
+            label = str(det.get("label", "object")).strip().lower()
+            position = str(det.get("position", "center")).strip().lower()
+            distance = str(det.get("distance", "far")).strip().lower()
+            key = (label, position, distance)
+            if not label or key in seen:
+                continue
+            seen.add(key)
+            compact.append(key)
+            if len(compact) >= 4:
+                break
+
+        return compact
+
+    def _scan_step_prompt(self, heading: str, index: int) -> str:
+        if index == 0:
+            return f"Face {heading} and hold for a moment. I am checking this direction now."
+        return f"Good. Now turn gently to {heading} and hold there for one second."
+
+    @staticmethod
+    def _direction_risk(snapshot: List[Tuple[str, str, str]]) -> int:
+        distance_risk = {"near": 5, "medium": 3, "far": 1}
+        risk = 0
+        for _, position, distance in snapshot:
+            risk += distance_risk.get(distance, 2)
+            if position == "center":
+                risk += 1
+        return risk
+
+    def _best_heading_from_memory(self) -> Optional[str]:
+        if not self._spatial_memory:
+            return None
+
+        best_heading = None
+        best_score = 10**6
+        for heading in self.config.scan_heading_labels:
+            snapshot = self._spatial_memory.get(heading, [])
+            score = self._direction_risk(snapshot)
+            if score < best_score:
+                best_score = score
+                best_heading = heading
+        return best_heading
+
+    def _scan_memory_summary_sentence(self) -> str:
+        if not self._spatial_memory:
+            return "I still need a little more scan data."
+
+        best_heading = self._best_heading_from_memory()
+        if not best_heading:
+            return "I have a rough layout now."
+
+        best_snapshot = self._spatial_memory.get(best_heading, [])
+        if not best_snapshot:
+            return f"The clearest space is around {best_heading}."
+
+        top_label = best_snapshot[0][0]
+        return f"The cleanest direction is around {best_heading}, with {top_label} off to the side."
+
+    def _navigation_hint_from_memory(self) -> str:
+        best_heading = self._best_heading_from_memory()
+        if not best_heading:
+            return "Take two short steps forward and keep your cane sweeping left to right."
+        return f"From the scan, the safest opening is near {best_heading}. Turn slightly that way and take three small steps."
+
+    def _update_environment_scan(self, enriched: List[Detection], recompute: bool) -> Optional[str]:
+        if not self._scan_active:
+            return None
+
+        headings = self.config.scan_heading_labels
+        if self._scan_heading_index >= len(headings):
+            return None
+
+        now = time.time()
+        heading = headings[self._scan_heading_index]
+
+        if self._scan_prompted_index != self._scan_heading_index:
+            self._scan_prompted_index = self._scan_heading_index
+            self._scan_step_started_ts = now
+            return self._scan_step_prompt(heading, self._scan_heading_index)
+
+        if recompute and heading not in self._scan_snapshots:
+            self._scan_snapshots[heading] = self._compact_scan_snapshot(enriched)
+
+        if (now - self._scan_step_started_ts) < self.config.scan_hold_seconds:
+            return None
+
+        if heading not in self._scan_snapshots:
+            self._scan_snapshots[heading] = self._compact_scan_snapshot(enriched)
+
+        self._scan_heading_index += 1
+        self._scan_prompted_index = -1
+
+        if self._scan_heading_index < len(headings):
+            return None
+
+        self._spatial_memory = dict(self._scan_snapshots)
+        self._scan_last_completed_ts = time.time()
+        self._scan_active = False
+        summary = self._scan_memory_summary_sentence()
+
+        if self._scan_purpose == "navigation":
+            return f"Great, I mapped your space. {summary} I will guide you step by step now."
+        return f"Thanks for turning. I have a better picture now. {summary}"
+
     def _should_recompute_detections(self, frame: Any) -> bool:
         if not self._cached_detections:
             return True
@@ -424,14 +631,32 @@ class RealTimeAISystem:
 
         return low_conf and high_detail
 
+    @staticmethod
+    def _clock_from_position(position: str) -> str:
+        pos = position.strip().lower()
+        if pos == "left":
+            return "10 o'clock"
+        if pos == "right":
+            return "2 o'clock"
+        return "12 o'clock"
+
+    @staticmethod
+    def _steps_from_distance(distance: str) -> str:
+        dist = distance.strip().lower()
+        if dist == "near":
+            return "about one step"
+        if dist == "medium":
+            return "about three steps"
+        return "about five steps"
+
     def _fallback_instruction(self, mode: AssistantMode, scene_text: str) -> str:
         if mode == AssistantMode.NAVIGATION:
-            return "Keep going. Hug the left side and slow down slightly."
+            return "You are doing well. Turn a little toward 11 o'clock and take two short steps."
         if mode == AssistantMode.OBSTACLE_AWARENESS:
-            return "Stop. Listen and feel the air before moving."
+            return "Pause here for a second, then scan gently left and right with your cane."
         if "no objects" in scene_text.lower():
-            return "Path ahead looks clear. Take two slow steps forward."
-        return "Something is nearby. Slow down and sweep your cane."
+            return "It feels open ahead around 12 o'clock. Take two slow, careful steps forward."
+        return "I notice nearby objects. Slow down, keep your cane moving, and stay centered."
 
     def _sanitize_instruction(self, raw_text: str, mode: AssistantMode, scene_text: str) -> str:
         text = " ".join(str(raw_text).strip().split())
@@ -472,9 +697,9 @@ class RealTimeAISystem:
                 return self._fallback_instruction(mode, scene_text)
             if any(len(w) > 16 for w in words):
                 return self._fallback_instruction(mode, scene_text)
-            # Cap at ~60 words to keep TTS reasonable
-            if len(words) > 60:
-                cleaned = " ".join(words[:60])
+            # Cap at ~75 words to keep TTS vivid but concise.
+            if len(words) > 75:
+                cleaned = " ".join(words[:75])
             return cleaned
 
         # Navigation/obstacle modes: keep exactly one short sentence.
@@ -486,8 +711,8 @@ class RealTimeAISystem:
         words = sentence.split()
         if len(words) < 4:
             return self._fallback_instruction(mode, scene_text)
-        if len(words) > 16:
-            sentence = " ".join(words[:16])
+        if len(words) > 24:
+            sentence = " ".join(words[:24])
 
         # Filter likely malformed/hallucinated token bursts.
         if any(len(w) > 16 for w in sentence.split()):
@@ -497,6 +722,7 @@ class RealTimeAISystem:
         allowed_verbs = {
             "move", "step", "turn", "keep", "stop", "pause", "scan", "continue",
             "shift", "slow", "go", "avoid", "clear", "watch", "ahead", "path",
+            "face", "take", "head", "sweep",
         }
         if not any(w.lower().strip(",") in allowed_verbs for w in sentence.split()):
             return self._fallback_instruction(mode, scene_text)
@@ -509,19 +735,22 @@ class RealTimeAISystem:
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") == "center":
                 label = str(det.get("label", "object")).strip()
-                return True, f"{label.capitalize()} directly ahead. Stop now."
+                clock = self._clock_from_position("center")
+                return True, f"Careful, {label} at {clock}, about one step ahead. Please stop now."
         # Immediate hazard: near + side — name the object and give clear action
         for det in enriched:
             if det.get("distance") == "near" and det.get("position") in {"left", "right"}:
                 label = str(det.get("label", "object")).strip()
                 side = det.get("position")
                 opposite = "right" if side == "left" else "left"
-                return True, f"{label.capitalize()} close on your {side}. Step to your {opposite}."
+                clock = self._clock_from_position(str(side))
+                return True, f"{label.capitalize()} is close near {clock}. Shift slightly to your {opposite}."
         # Early warning: medium + center — give extra reaction time
         for det in enriched:
             if det.get("distance") == "medium" and det.get("position") == "center":
                 label = str(det.get("label", "something")).strip()
-                return True, f"{label.capitalize()} ahead, a few steps away. Slow down."
+                steps = self._steps_from_distance("medium")
+                return True, f"{label.capitalize()} is around 12 o'clock, {steps} ahead. Slow down gently."
         return False, ""
 
     def _scene_signature(self, enriched: List[Detection]) -> str:
@@ -738,6 +967,10 @@ class RealTimeAISystem:
         if hazard:
             return hazard_text, "rule", "high", True
 
+        if self._scan_is_stale() and not self._scan_active:
+            self._start_environment_scan("navigation", force=True)
+            return "Before moving forward, let us do a quick 360 scan for a safer route.", "rule", "medium", False
+
         now = time.time()
         if (
             self._route_origin
@@ -781,7 +1014,10 @@ class RealTimeAISystem:
         if cloud_text:
             return cloud_text, "cloud", "medium", False
 
-        return local_text, "local_llm", "medium", False
+        if local_text:
+            return local_text, "local_llm", "medium", False
+
+        return self._navigation_hint_from_memory(), "rule", "medium", False
 
     def _inference_loop(self) -> None:
         self.logger.info("Inference thread started.")
@@ -851,9 +1087,13 @@ class RealTimeAISystem:
                     if major_scene_change:
                         self._last_major_change_ts = time.time()
 
-                response_text = ""
+                scan_was_active = self._scan_active
+                scan_text = self._update_environment_scan(enriched, recompute)
+                scan_in_control = scan_was_active
+
+                response_text = scan_text or ""
                 source = "rule"
-                priority = "medium"
+                priority = "medium" if response_text else "low"
                 interrupt = False
 
                 if mode == AssistantMode.OBSTACLE_AWARENESS:
@@ -864,6 +1104,28 @@ class RealTimeAISystem:
                         priority = "high"
                         interrupt = True
                     else:
+                        if not scan_in_control:
+                            with self._llm_lock:
+                                if not self._is_llm_running:
+                                    self._is_llm_running = True
+                                    threading.Thread(
+                                        target=self._async_llm_worker,
+                                        args=(mode, scene_text, enriched, avg_conf, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed),
+                                        daemon=True
+                                    ).start()
+
+                        now = time.time()
+                        if not response_text and (now - self._last_mode_status_ts) >= self.config.mode_status_interval_sec:
+                            if scan_in_control:
+                                response_text = "Nice and slow. Keep turning while I map each direction."
+                            else:
+                                response_text = "Area clear so far. Keep moving carefully."
+                            source = "rule"
+                            priority = "low"
+                            self._last_mode_status_ts = now
+                else:
+                    # For all other modes, dispatch to async LLM only when scan workflow is idle.
+                    if not scan_in_control:
                         with self._llm_lock:
                             if not self._is_llm_running:
                                 self._is_llm_running = True
@@ -873,31 +1135,14 @@ class RealTimeAISystem:
                                     daemon=True
                                 ).start()
 
-                        now = time.time()
-                        if not response_text and (now - self._last_mode_status_ts) >= self.config.mode_status_interval_sec:
-                            response_text = "Area clear so far. Keep moving carefully."
-                            source = "rule"
-                            priority = "low"
-                            self._last_mode_status_ts = now
-                else:
-                    # For all other modes, dispatch to async LLM
-                    with self._llm_lock:
-                        if not self._is_llm_running:
-                            self._is_llm_running = True
-                            threading.Thread(
-                                target=self._async_llm_worker,
-                                args=(mode, scene_text, enriched, avg_conf, recompute, scene_signature, major_scene_change, complex_environment, cloud_needed),
-                                daemon=True
-                            ).start()
-
                 # Keep user informed even in stable scenes via fast rules
                 if not response_text and not self._is_llm_running and (time.time() - self._last_spoken_ts) >= self.config.speech_keepalive_interval_sec:
                     if mode == AssistantMode.SCENE_DESCRIPTION and not major_scene_change:
-                        response_text = "Still scanning. No new objects detected."
+                        response_text = "I am still with you. No major changes right now."
                         source = "rule"
                         priority = "low"
                     elif mode == AssistantMode.NAVIGATION and not major_scene_change:
-                        response_text = "Path unchanged. Continue at your current pace."
+                        response_text = "Path looks steady. Take one careful step and keep your cane sweeping."
                         source = "rule"
                         priority = "low"
 

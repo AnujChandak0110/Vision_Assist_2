@@ -34,6 +34,7 @@ from llm.cloud_api import call_cloud_api
 from llm.ollama_local import query_ollama
 from memory.temporal_memory import TemporalMemory
 from utils.scene_formatter import format_scene
+from voice.command_listener import VoiceCommandListener, VoiceConfig
 
 
 class _FakeScalar:
@@ -235,6 +236,27 @@ def test_no_object_scenario_and_rule_safety_text():
 
     assert scene == "no objects detected"
     assert "Move slowly" in rule_text or "scan" in rule_text.lower()
+
+
+@pytest.mark.unit
+def test_voice_command_flexible_intent_synonyms():
+    listener = VoiceCommandListener.__new__(VoiceCommandListener)
+    listener.config = VoiceConfig(require_wake_word=False)
+
+    assert listener._normalize_command("describe what is around me") == "scene_description"
+    assert listener._normalize_command("please guide me to the exit") == "route_to:the exit"
+    assert listener._normalize_command("watch out mode") == "obstacle_awareness"
+    assert listener._normalize_command("hold on") == "pause"
+    assert listener._normalize_command("continue") == "resume"
+
+
+@pytest.mark.unit
+def test_voice_command_route_parsing_variations():
+    listener = VoiceCommandListener.__new__(VoiceCommandListener)
+    listener.config = VoiceConfig(require_wake_word=False)
+
+    assert listener._normalize_command("navigate from home to office") == "route:navigate from home to office"
+    assert listener._normalize_command("take me to kitchen") == "route_to:kitchen"
 
 
 @pytest.mark.performance

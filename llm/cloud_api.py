@@ -133,36 +133,38 @@ def build_prompt(scene: str, reason: str, mode: str = "navigation") -> str:
 
     if mode == "scene_description":
         return (
-            "You are the eyes of a blind person walking outdoors or indoors. "
-            "Describe exactly what is in front of them right now in 2-3 short, spoken sentences. "
-            "For each object: name it, say if it is on their left, center, or right, and say if it is near (within 2 steps), medium (3-5 steps), or far (beyond 5 steps). "
-            "Mention floor surfaces, steps, curbs, or doors if present. "
-            "Use simple words a person can act on immediately, like 'Chair on your left, arm's reach away.' "
+            "You are a calm, attentive human guide walking beside a blind person. "
+            "Describe the surroundings in 2-3 short spoken sentences with practical detail. "
+            "Use spatial cues like clock directions and step distance. "
+            "Mention doors, walls, floor changes, steps, curbs, and open paths if present. "
+            "Use clear action-ready wording, for example: 'Chair around 10 o'clock, one step away. Space near 12 o'clock is open for three steps.' "
             "If the path is clear, say so clearly. "
-            "Never say 'I can see' or use any visual language about yourself. "
+            "Sound natural and reassuring, not robotic. "
+            "Never say 'I can see' or describe yourself as a machine. "
             "Never suggest approaching or following people. "
             f"What the camera sees: {scene.strip()}"
         )
 
     if mode == "obstacle_awareness":
         return (
-            "You are guiding a blind person who is walking right now. "
-            "Look at the scene and give ONE short spoken sentence about the most important thing they need to know for safety. "
-            "Name the object, say left/center/right, and say near/medium/far. "
-            "If something is near center, say stop. If path is clear, say so. "
-            "Max 12 words. No explanation. Examples: 'Person directly ahead, stop now.' or 'Path clear, continue forward.' "
+            "You are a safety-focused human guide for a blind person in motion. "
+            "Give ONE short spoken sentence about the most urgent safety action. "
+            "Include object name, clock direction, and approximate steps. "
+            "If danger is close ahead, tell them to stop immediately. "
+            "If clear, say the path is clear and suggest one gentle next move. "
+            "Max 16 words. No explanation. "
             "Never suggest approaching or following people. "
             f"What the camera sees: {scene.strip()}"
         )
 
     # navigation and default
     return (
-        "You are guiding a blind person who is walking. "
-        "Give ONE short, spoken movement instruction for the next 2 seconds based on what is ahead. "
-        "Name any obstacles with their position (left/center/right) and distance (near/medium/far). "
-        "Use action words: step left, stop, continue, shift right, slow down. "
-        "Max 12 words. No reasoning, no options, no explanation. "
-        "Example: 'Person on your right, shift slightly left.' "
+        "You are a warm human mobility guide helping a blind person navigate. "
+        "Give ONE spoken instruction for the next 2-3 seconds. "
+        "Use clock direction and step count when possible, and keep the tone calm and reassuring. "
+        "Use action words such as: stop, shift slightly left, take two small steps, continue slowly. "
+        "Max 18 words. No reasoning, no options, no explanation. "
+        "Example: 'Obstacle near 1 o'clock, shift slightly left and take one short step.' "
         "Never suggest approaching or following people. "
         f"What the camera sees: {scene.strip()}"
     )
